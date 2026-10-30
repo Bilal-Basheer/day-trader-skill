@@ -21,6 +21,31 @@ an order on its own. Paper trading is the default.
 > [github.com/Jakeschincariol/trader-skill](https://github.com/Jakeschincariol/trader-skill).
 > This repo is its day-trading sequel: the Trader skill v2.
 
+## Pakistan Stock Exchange (this fork)
+
+This fork adds one skill, `/trader-psx`, for the Pakistan Stock Exchange. The
+eleven skills below are unchanged and remain US-only. See
+[`trader-psx/SKILL.md`](trader-psx/SKILL.md).
+
+```bash
+git clone -b pakistan-market https://github.com/Bilal-Basheer/day-trader-skill.git
+cp -r day-trader-skill/trader-psx ~/.claude/skills/
+```
+
+| | |
+| --- | --- |
+| Prices | Yahoo daily bars for `SYMBOL.KA`, free and unofficial. **Daily only.** |
+| News | Business Recorder, Dawn, Express Tribune and ProPakistani RSS feeds |
+| Clock | PSX regular market in Pakistan time, including the split Friday |
+| Orders | A ticket you type into your own broker's app. It never places an order |
+
+**It is not bar-by-bar day trading.** No free source open to automated tools
+provides intraday PSX bars, so opening-range breakouts, the Entry Timer and the
+Time Machine have no PSX version. It does not read the PSX Data Portal, because
+that site's terms ban automated tools without PSX's written permission. Holidays,
+the price band and trading costs need checking in your config before you rely on
+them: the table in the SKILL.md says which rules are confirmed and which are not.
+
 ## Install
 
 Paste this into Claude:
@@ -210,6 +235,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-psx/         SKILL.md, psx.py, psx_universe.txt, psx_config.example.json (this fork)
 tests/              unittest suite + offline fixtures
 ```
 

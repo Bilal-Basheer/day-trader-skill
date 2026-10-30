@@ -1,0 +1,62 @@
+# PSX symbols with daily bars on Yahoo (as SYMBOL.KA), checked 2026-10-30. Not an index list.
+# Add your own as SYMBOL|Company Name. Yahoo had no chart for HUBC, ENGRO, ENGROH, AVN or PSMC.
+OGDC|Oil and Gas Development Company Limited
+PPL|Pakistan Petroleum Limited
+PSO|Pakistan State Oil Company Limited
+SNGP|Sui Northern Gas Pipelines Limited
+SSGC|Sui Southern Gas Company Limited
+MARI|Mari Energies Limited
+POL|Pakistan Oilfields Limited
+ATRL|Attock Refinery Limited
+NRL|National Refinery Limited
+PRL|Pakistan Refinery Limited
+HBL|Habib Bank Limited
+UBL|United Bank Limited
+MCB|MCB Bank Limited
+NBP|National Bank of Pakistan
+BAHL|Bank AL Habib Limited
+MEBL|Meezan Bank Limited
+BAFL|Bank Alfalah Limited
+ABL|Allied Bank Limited
+FABL|Faysal Bank Limited
+AKBL|Askari Bank Limited
+BOP|Bank of Punjab
+HMB|Habib Metropolitan Bank Limited
+LUCK|Lucky Cement Limited
+DGKC|D.G. Khan Cement Company Limited
+MLCF|Maple Leaf Cement Factory Limited
+CHCC|Cherat Cement Company Limited
+FCCL|Fauji Cement Company Limited
+KOHC|Kohat Cement Company Limited
+PIOC|Pioneer Cement Limited
+ACPL|Attock Cement Pakistan Limited
+FFC|Fauji Fertilizer Company Limited
+EFERT|Engro Fertilizers Limited
+FATIMA|Fatima Fertilizer Company Limited
+KEL|K-Electric Limited
+KAPCO|Kot Addu Power Company Limited
+NCPL|Nishat Chunian Power Limited
+SYS|Systems Limited
+TRG|TRG Pakistan Limited
+NETSOL|NetSol Technologies Limited
+PTC|Pakistan Telecommunication Company Limited
+EPCL|Engro Polymer and Chemicals Limited
+LOTCHEM|Lotte Chemical Pakistan Limited
+NESTLE|Nestle Pakistan Limited
+COLG|Colgate-Palmolive Pakistan Limited
+UNITY|Unity Foods Limited
+MTL|Millat Tractors Limited
+GHNI|Ghandhara Industries Limited
+INDU|Indus Motor Company Limited
+HCAR|Honda Atlas Cars Pakistan Limited
+SAZEW|Sazgar Engineering Works Limited
+SEARL|The Searle Company Limited
+GLAXO|GlaxoSmithKline Pakistan Limited
+ILP|Interloop Limited
+NML|Nishat Mills Limited
+NCL|Nishat Chunian Limited
+GATM|Gul Ahmed Textile Mills Limited
+AGP|AGP Limited
+TGL|Tariq Glass Industries Limited
+GHGL|Ghani Glass Limited
+CNERGY|Cnergyico PK Limited
