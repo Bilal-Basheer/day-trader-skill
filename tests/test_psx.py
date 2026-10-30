@@ -475,6 +475,21 @@ class Intraday(unittest.TestCase):
         self.assertEqual(self.st(OPENING, "15:00")["status"], "expired")
         self.assertEqual(psx.orb_status([], at(datetime.date(2026, 10, 31), "10:00"), 15, CFG)["status"], "closed")
 
+    def test_post_close_candles_cannot_fire_the_rule(self):
+        rows = OPENING + [("15:25", 101, 101.5, 100, 101), ("15:30", 103, 103, 103, 103), ("15:35", 103, 103, 103, 103)]
+        self.assertEqual(self.st(rows, "15:45")["status"], "expired")
+
+    def test_the_friday_break_is_not_trading(self):
+        rows = [("09:15", 100, 101, 99, 100), ("09:20", 100, 102, 99.5, 101), ("09:25", 101, 102, 100, 101),
+                ("12:30", 103, 103, 103, 103), ("14:30", 101, 101, 101, 101)]
+        self.assertEqual(self.st(rows, "13:00", day=FRI)["status"], "waiting")
+        rows.append(("14:35", 101, 104, 101, 103))
+        self.assertEqual(self.st(rows, "14:40", day=FRI)["at"], "14:40")
+
+    def test_post_close_prices_do_not_reach_a_stop_or_target(self):
+        rows = OPENING + [("09:45", 101, 104, 101, 103), ("15:35", 103, 110, 90, 103)]
+        self.assertEqual(psx.replay_day(bars_of(rows), THU, 15, 1.0, CFG), "neither")
+
     def test_or_minutes_must_fit_the_grid(self):
         with self.assertRaises(psx.PsxError):
             psx.orb_status([], at(THU, "10:00"), 7, CFG)

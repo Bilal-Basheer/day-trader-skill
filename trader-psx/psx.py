@@ -1045,6 +1045,17 @@ def complete_bars(bars, day, now):
     return [b for b in bars if b["t"].date() == day and b["t"] + width <= now]
 
 
+def regular_bars(bars, day, cfg):
+    """Only candles from the regular market: the feed also carries the post-close session
+    (15:30 to 15:50, 16:30 to 16:50 on a Friday) and quiet candles in the Friday break."""
+    width = datetime.timedelta(minutes=BAR_MINUTES)
+    spans = []
+    for a, b in sessions_for(day, cfg):
+        start = datetime.datetime.combine(day, a)
+        spans.append((start.replace(minute=start.minute - start.minute % BAR_MINUTES), datetime.datetime.combine(day, b)))
+    return [x for x in bars if any(a <= x["t"] and x["t"] + width <= b for a, b in spans)]
+
+
 def range_start(day, cfg):
     """The first candle of the session on the 5-minute grid: 09:32 -> 09:30, 09:17 -> 09:15."""
     spans = sessions_for(day, cfg)
@@ -1064,7 +1075,7 @@ def orb_status(bars, now, or_minutes, cfg):
     if or_minutes % BAR_MINUTES or or_minutes <= 0:
         raise PsxError("--or-minutes must be a multiple of %d" % BAR_MINUTES)
     range_end = start + datetime.timedelta(minutes=or_minutes)
-    done = complete_bars(bars, day, now)
+    done = regular_bars(complete_bars(bars, day, now), day, cfg)
     in_range = [b for b in done if start <= b["t"] < range_end]
     if now < range_end:
         return {"status": "forming", "range_ends": range_end.strftime("%H:%M")}
@@ -1101,7 +1112,7 @@ def replay_day(bars, day, or_minutes, target_r, cfg):
     if stop >= entry:
         return None
     target = entry + (entry - stop) * target_r
-    for b in complete_bars(bars, day, end):
+    for b in regular_bars(complete_bars(bars, day, end), day, cfg):
         if b["t"] < closed:
             continue
         if b["low"] <= stop:
