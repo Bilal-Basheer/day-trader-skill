@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Pakistan Stock Exchange tool for trader-psx. Standard library only.
+"""The shared engine behind the psx-* skills. Standard library only.
 
     python3 psx.py clock                                  # is the PSX open? (Pakistan time)
     python3 psx.py scan                                   # daily setups -> trader/psx_watchlist.json
@@ -15,7 +15,12 @@
     python3 psx.py intraday OGDC                          # today's 5-minute candles and how old they are
     python3 psx.py orb --symbols OGDC,HBL --at 10:15      # opening-range breakouts so far
     python3 psx.py entry OGDC                             # waiting / triggered / expired
-    python3 psx.py history OGDC --days 60 --target 1R     # the same rule on past sessions
+    python3 psx.py history OGDC --days 60 --target 2R     # the same rule on past sessions
+    python3 psx.py timemachine --write                    # 10,000 replays of the plan
+    python3 psx.py universe                               # every symbol -> trader/psx_universe.txt
+    python3 psx.py watch OGDC --every 60                  # entry, bar by bar, until it triggers
+    python3 psx.py alert-add --from-plan                  # stop, target, flat by
+    python3 psx.py alert-check                            # rings what hit, once
 
 Data, and why these and no others:
 
@@ -44,8 +49,10 @@ import html
 import json
 import math
 import os
+import random
 import re
 import ssl
+import statistics
 import sys
 import time
 import urllib.error
@@ -74,7 +81,14 @@ ORDERS = "trader/psx_orders.json"
 NEWS_STATE = "trader/state/psx_news.json"
 RISK_STATE = "trader/state/psx_risk.json"
 TRADES_STATE = "trader/state/psx_trades.json"
-ORB_FILE = "trader/psx_orb.json"
+USER_UNIVERSE = "trader/psx_universe.txt"
+ENTRIES_FILE = "trader/psx_entries.json"
+TIMEMACHINE_FILE = "trader/psx_timemachine.json"
+ALERTS_FILE = "trader/psx_alerts.json"
+MIN_SESSIONS = 20    # fewer full sessions than this is too thin to replay
+COIN_FLIP = 0.05     # verdict thresholds, the same as trader-timemachine
+STRONG = 0.15
+MANY_NEITHER = 0.40
 ENTRY_FILE = "trader/psx_entry.json"
 
 # Sandbox host on purpose: this tool only reads market data and has no use for live accounts.
@@ -295,8 +309,17 @@ def load_config(path=CONFIG):
     return cfg
 
 
-def read_universe(path=UNIVERSE):
+def universe_path(a=None):
+    """--universe, else the full list from `universe`, else the short list shipped here."""
+    given = getattr(a, "universe", None)
+    if given:
+        return given
+    return USER_UNIVERSE if os.path.exists(USER_UNIVERSE) else UNIVERSE
+
+
+def read_universe(path=None):
     """[(symbol, name)] from SYMBOL|Name lines."""
+    path = path or universe_path()
     out = []
     try:
         with open(path, encoding="utf-8") as fh:
@@ -624,13 +647,13 @@ def parse_target(text):
     raise PsxError("--target must be 1R, 1.5R, 2R or price:310")
 
 
-def build_plan(sym, bars, stop_spec, target_spec, entry, cfg, now_utc):
+def build_plan(sym, bars, stop_spec, target_spec, entry, cfg, now_utc, estimate_price=None):
     """Pure. Refuses anything that does not hold together."""
     if not bars:
         raise PsxError("no daily bars for %s" % sym)
     prev = bars[-1]
     estimate = entry is None
-    entry = cents(prev["close"] if estimate else entry)
+    entry = cents((estimate_price or prev["close"]) if estimate else entry)
     if entry <= 0:
         raise PsxError("the entry must be above zero")
     low, high = band(prev["close"], cfg["price_band_pct"])
@@ -659,8 +682,8 @@ def build_plan(sym, bars, stop_spec, target_spec, entry, cfg, now_utc):
     today = to_pkt(now_utc).date()
     notes = []
     if estimate:
-        notes.append("Entry is yesterday's close, an estimate: there is no free live PSX price here. "
-                     "Pass --entry with the price on your broker's screen before /trader-psx check.")
+        notes.append("Entry is an estimate (%s), not a price you can buy at. " % ("the breakout candle's close" if estimate_price else "yesterday's close") +
+                     "Pass --entry with the price on your broker's screen before /psx-risk.")
     if target > high:
         notes.append("The target %.2f is above the %g%% band top %.2f, so it cannot trade today." % (
             target, cfg["price_band_pct"], high))
@@ -715,7 +738,7 @@ def check_order(order, plan, cfg, trades, now_utc):
     if plan.get("day") != day:
         blocks.append("the plan is from %s, not today: plan again" % plan.get("day"))
     if plan.get("entry_is_estimate"):
-        blocks.append("the entry is yesterday's close: plan again with --entry and your broker's live price")
+        blocks.append("the entry is an estimate, yesterday's close or the breakout candle: plan again with --entry and your broker's live price")
     if order.get("symbol") in cfg["blocked"]:
         blocks.append("%s is on your blocked list" % order.get("symbol"))
     stop, target, entry = order.get("stop_price"), order.get("target_price"), order.get("limit_price")
@@ -776,7 +799,7 @@ def cmd_clock(a, cfg):
 
 def cmd_scan(a, cfg):
     now_utc = parse_now(a.now)
-    symbols = symbol_list(a.symbols) if a.symbols else [s for s, _ in read_universe(a.universe)]
+    symbols = symbol_list(a.symbols) if a.symbols else [s for s, _ in read_universe(universe_path(a))]
     first = {"done": False}
 
     def fetch(sym):
@@ -847,7 +870,7 @@ def read_feeds(a):
 def cmd_news(a, cfg):
     now_utc = parse_now(a.now)
     tickers = news_tickers(a)
-    match = matchers(read_universe(a.universe), tickers)
+    match = matchers(read_universe(universe_path(a)), tickers)
     state = read_json(NEWS_STATE, {"seen": {}})
     seen = {} if a.all else state.get("seen", {})
     items, errors = read_feeds(a)
@@ -875,11 +898,34 @@ def cmd_news(a, cfg):
     return 0 if picked else 1
 
 
+def todays_entry(sym, now_utc):
+    """trader/psx_entry.json when it is from today, for this symbol or for any if sym is None."""
+    doc = read_json(ENTRY_FILE, {})
+    if not doc.get("symbol") or not str(doc.get("as_of_pkt", "")).startswith(to_pkt(now_utc).date().isoformat()):
+        return None
+    return doc if sym in (None, doc["symbol"]) else None
+
+
 def cmd_plan(a, cfg):
     now_utc = parse_now(a.now)
-    sym = clean_symbol(a.symbol)
+    sym = clean_symbol(a.symbol) if a.symbol else None
+    entered = todays_entry(sym, now_utc)
+    if not sym:
+        if not entered:
+            raise PsxError("no entry from today: name a symbol, or run /psx-entry first")
+        sym = entered["symbol"]
     bars = get_bars(sym, now_utc, cfg, a.offline)
-    plan = build_plan(sym, bars, parse_stop(a.stop), parse_target(a.target), a.entry, cfg, now_utc)
+    triggered = entered if entered and entered.get("status") == "triggered" else None
+    stop_text = a.stop or ("or-mid" if triggered else "atr")
+    if stop_text.lower() == "or-mid":
+        if not triggered:
+            raise PsxError("--stop or-mid needs a triggered entry from today: run /psx-entry first")
+        stop_spec = ("price", floor_cents((triggered["or_high"] + triggered["or_low"]) / 2.0))
+    else:
+        stop_spec = parse_stop(stop_text)
+    plan = build_plan(sym, bars, stop_spec, parse_target(a.target), a.entry, cfg, now_utc,
+                      estimate_price=triggered["price"] if triggered else None)
+    plan["stop_rule"] = stop_text.lower()
     if a.json:
         print(json.dumps(plan, indent=2))
     else:
@@ -939,7 +985,7 @@ def cmd_ticket(a, cfg):
     ready = (verdict.get("pass") and verdict.get("fingerprint") == fingerprint(order)
              and verdict.get("day") == to_pkt(now_utc).date().isoformat())
     if not ready:
-        print("NOT READY: this exact order has no PASS from today. Run /trader-psx check first.")
+        print("NOT READY: this exact order has no PASS from today. Run /psx-risk first.")
         return 1
     print("TICKET, READY. Nothing is sent: this tool cannot place an order. Type it into your broker's app yourself.")
     print("  BUY %d %s, limit %.2f (%s)" % (order["qty"], order["symbol"], order["limit_price"], money(order["notional"])))
@@ -947,7 +993,7 @@ def cmd_ticket(a, cfg):
     print("  Flat by %s Pakistan time." % (order["flat_by"] or "the close"))
     print("  Enter the stop and the target as separate orders if your broker has them, or watch them yourself:")
     print("  not every PSX broker offers stop or bracket orders. Ask yours, and ask how same-day selling is treated.")
-    print("Then run /trader-psx record so the daily limits count it.")
+    print("Then run `record` so the daily limits count it.")
     return 0
 
 
@@ -977,7 +1023,8 @@ def pypsx_get(path, params):
         raise PsxError("intraday data needs a pyPSX key: create one at markets.pypsx.com, then set "
                        "PYPSX_API_KEY_ID and PYPSX_API_SECRET_KEY in your environment (never in the chat)")
     base = os.environ.get("PYPSX_BASE", PYPSX_BASE).rstrip("/")
-    req = urllib.request.Request(base + path + "?" + urllib.parse.urlencode(params), headers={
+    query = "?" + urllib.parse.urlencode(params) if params else ""
+    req = urllib.request.Request(base + path + query, headers={
         "User-Agent": UA, "PYPSX-API-KEY-ID": key, "PYPSX-API-SECRET-KEY": secret})
     for attempt in (1, 2):
         try:
@@ -1179,7 +1226,10 @@ def cmd_orb(a, cfg):
     if not sessions_for(now.date(), cfg):
         print("The PSX is closed on %s (%s)." % (now.date(), holiday_name(now.date(), cfg) or "weekend"))
         return 1
-    symbols = symbol_list(a.symbols) if a.symbols else [s for s, _ in read_universe(a.universe)]
+    if a.watchlist:
+        symbols = [h["symbol"] for h in read_json(WATCHLIST)["hits"]]
+    else:
+        symbols = symbol_list(a.symbols) if a.symbols else [s for s, _ in read_universe(universe_path(a))]
     data = get_candles(symbols, *day_span(now), offline=a.offline)
     hits, counts = [], {"requested": len(symbols), "no_data": 0, "unusable": 0, "usable": 0}
     newest = None
@@ -1216,12 +1266,50 @@ def cmd_orb(a, cfg):
             print("Newest candle starts %s: check how far that is behind your broker's screen." % newest.strftime("%H:%M"))
         print("A later hit is closer to the price now, and a hit goes stale as the price moves. " + NOTE)
     if not a.no_write and counts["usable"]:
-        write_json(ORB_FILE, doc)
+        write_json(WATCHLIST, doc)
     return 0 if hits else 1
+
+
+def say_status(sym, st):
+    s_ = st["status"]
+    if s_ == "triggered":
+        return "%s TRIGGERED at %s: closed %.2f, %.2f%% over the range high %.2f (range low %.2f). Last close %.2f at %s." % (
+            sym, st["at"], st["price"], st["over_pct"], st["or_high"], st["or_low"], st["last"], st["last_bar"])
+    if s_ == "waiting":
+        return "%s waiting: last close %.2f, range high %.2f (%.2f away)." % (sym, st["last"], st["or_high"], st["or_high"] - st["last"])
+    if s_ == "expired":
+        return "%s expired: no close above %.2f before the entry window ended." % (sym, st["or_high"])
+    if s_ == "forming":
+        return "%s: the opening range ends at %s." % (sym, st["range_ends"])
+    if s_ == "unusable":
+        return "%s: not usable, %s (a halt, a thin stock or a feed gap)." % (sym, st["reason"])
+    return "%s: the PSX is closed today." % sym
 
 
 def cmd_entry(a, cfg):
     now = pkt_now(a)
+    if a.watchlist:
+        symbols = [h["symbol"] for h in read_json(WATCHLIST)["hits"]]
+        if not symbols:
+            raise PsxError("the watchlist is empty: run /psx-scanner first")
+        data = get_candles(symbols, *day_span(now), offline=a.offline)
+        rows = []
+        for sym in symbols:
+            st = orb_status((data.get(sym) or {"bars": []})["bars"], now, a.or_minutes, cfg)
+            rows.append(dict(st, symbol=sym))
+        order = {"triggered": 0, "waiting": 1, "forming": 2, "expired": 3, "unusable": 4, "closed": 5}
+        rows.sort(key=lambda r: (order[r["status"]], r.get("at", ""), r["symbol"]))
+        doc = {"as_of_pkt": now.strftime("%Y-%m-%d %H:%M"), "rows": rows}
+        write_json(ENTRIES_FILE, doc)
+        if a.json:
+            print(json.dumps(doc, indent=2))
+        else:
+            for r in rows:
+                print("  " + say_status(r["symbol"], r))
+            print("%d of %d triggered. The user picks one: never pick for them." % (sum(r["status"] == "triggered" for r in rows), len(rows)))
+        return 0 if any(r["status"] == "triggered" for r in rows) else 1
+    if not a.symbol:
+        raise PsxError("name a symbol, or use --watchlist")
     sym = clean_symbol(a.symbol)
     got = get_candles([sym], *day_span(now), offline=a.offline).get(sym) or {"bars": []}
     st = orb_status(got["bars"], now, a.or_minutes, cfg)
@@ -1230,24 +1318,28 @@ def cmd_entry(a, cfg):
     if a.json:
         print(json.dumps(st, indent=2))
     else:
-        s = st["status"]
-        if s == "triggered":
-            print("%s TRIGGERED at %s: closed %.2f, %.2f%% over the range high %.2f." % (sym, st["at"], st["price"], st["over_pct"], st["or_high"]))
-            print("Read the live price off your broker's screen, then: plan %s --entry PRICE --stop price:%.2f --write" % (
-                sym, (st["or_high"] + st["or_low"]) / 2.0))
-        elif s == "waiting":
-            print("%s waiting: last close %.2f, range high %.2f (%.2f away)." % (sym, st["last"], st["or_high"], st["or_high"] - st["last"]))
-        elif s == "expired":
-            print("%s expired: no close above %.2f before the entry window ended." % (sym, st["or_high"]))
-        elif s == "forming":
-            print("%s: the opening range ends at %s." % (sym, st["range_ends"]))
-        elif s == "unusable":
-            print("%s: not usable, %s (a halt, a thin stock or a feed gap)." % (sym, st["reason"]))
-        else:
-            print("%s: the PSX is closed today." % sym)
+        print(say_status(sym, st))
         print("%s. It never places an order." % age_line(done, now).capitalize())
     write_json(ENTRY_FILE, st)
     return 0 if st["status"] == "triggered" else 1
+
+
+def cmd_watch(a, cfg):
+    """Bar by bar until it triggers or the window ends. New candles only come every 5 minutes."""
+    sym = clean_symbol(a.symbol)
+    if a.every < 30:
+        raise PsxError("--every must be 30 seconds or more: be polite to the API")
+    deadline = time.time() + a.max_minutes * 60
+    while True:
+        now = pkt_now(a)
+        got = get_candles([sym], *day_span(now), offline=a.offline).get(sym) or {"bars": []}
+        st = orb_status(got["bars"], now, a.or_minutes, cfg)
+        st.update(symbol=sym, as_of_pkt=now.strftime("%Y-%m-%d %H:%M"))
+        print("%s  %s" % (now.strftime("%H:%M"), say_status(sym, st)), flush=True)
+        write_json(ENTRY_FILE, st)
+        if st["status"] in ("triggered", "expired", "closed", "unusable") or a.offline or a.now or time.time() >= deadline:
+            return 0 if st["status"] == "triggered" else 1
+        SLEEP(a.every)
 
 
 def cmd_history(a, cfg):
@@ -1273,8 +1365,283 @@ def cmd_history(a, cfg):
     return 0 if c["fired"] else 1
 
 
+def cmd_universe(a, cfg):
+    """Every symbol pyPSX lists, ETFs left out -> trader/psx_universe.txt."""
+    if a.offline:
+        with open(a.offline, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = pypsx_get("/symbols", {})
+    try:
+        rows = json.loads(text)["symbols"]
+        kept = [(r["symbol"], (r.get("name") or "").strip()) for r in rows if "ETF" not in r["symbol"] and " ETF" not in (r.get("name") or "")]
+    except (KeyError, TypeError, ValueError):
+        raise PsxError("pyPSX's symbol list was not in the documented shape")
+    os.makedirs(os.path.dirname(USER_UNIVERSE), exist_ok=True)
+    with open(USER_UNIVERSE, "w", encoding="utf-8") as fh:
+        for sym, name in kept:
+            fh.write("%s|%s\n" % (sym, name))
+    print("Kept %d of %d symbols (ETFs left out). Wrote %s." % (len(kept), len(rows), USER_UNIVERSE))
+    return 0
+
+
+def session_slots(day, cfg):
+    """The start of every regular-market 5-minute candle on a day."""
+    out = []
+    width = datetime.timedelta(minutes=BAR_MINUTES)
+    for a, b in sessions_for(day, cfg):
+        t = datetime.datetime.combine(day, a)
+        t = t.replace(minute=t.minute - t.minute % BAR_MINUTES)
+        end = datetime.datetime.combine(day, b)
+        while t + width <= end:
+            out.append(t)
+            t += width
+    return out
+
+
+def minute_of(t):
+    return t.hour * 60 + t.minute
+
+
+def full_sessions(bars, before, cfg, keep=59):
+    """{day: bars} for the last `keep` days with every regular candle there. Half data is left out."""
+    days = sorted({b["t"].date() for b in bars if b["t"].date() < before})
+    out = {}
+    for day in days:
+        d = regular_bars([b for b in bars if b["t"].date() == day], day, cfg)
+        if d and [b["t"] for b in d] == session_slots(day, cfg):
+            out[day] = d
+    return {d: out[d] for d in sorted(out)[-keep:]}
+
+
+def build_pool(sessions):
+    """{minute of day: [(high, low, close) / the close before]} from every full session."""
+    pool = {}
+    for d in sessions.values():
+        for prev, b in zip(d, d[1:]):
+            pc = prev["close"]
+            pool.setdefault(minute_of(b["t"]), []).append((b["high"] / pc, b["low"] / pc, b["close"] / pc))
+    return pool
+
+
+def simulate(pool, entry, stop, target, minutes, replays=10000, seed=19, window=2):
+    """Replay the rest of the day from the stock's own candles at about that time of day, as
+    trader-timemachine does. A candle touching both counts as the stop."""
+    risk = entry - stop
+    r_target = (target - entry) / risk
+    rng = random.Random(seed)
+    outcomes, closes = [], []
+    for _ in range(replays):
+        p, outcome = entry, None
+        for m in minutes:
+            drawn = pool.get(m + rng.randint(-window, window) * BAR_MINUTES) or pool.get(m)
+            if not drawn:
+                continue
+            h, lo, c = rng.choice(drawn)
+            if outcome is None:
+                if p * lo <= stop:
+                    outcome = "stop"
+                elif p * h >= target:
+                    outcome = "target"
+            p = p * c
+        outcomes.append(outcome or "neither")
+        closes.append(p)
+    cnt = {k: outcomes.count(k) for k in ("target", "stop", "neither")}
+    ordered = sorted(closes)
+    rs = [r_target if o == "target" else -1.0 if o == "stop" else (x - entry) / risk for o, x in zip(outcomes, closes)]
+    return {"replays": replays, "seed": seed, "window": window, "bars_left": len(minutes),
+            "p_target": round(cnt["target"] / float(replays), 4), "p_stop": round(cnt["stop"] / float(replays), 4),
+            "p_neither": round(cnt["neither"] / float(replays), 4),
+            "median_close": round(ordered[len(ordered) // 2], 2), "p5_close": round(ordered[int(0.05 * len(ordered))], 2),
+            "p95_close": round(ordered[int(0.95 * len(ordered))], 2), "avg_R": round(statistics.mean(rs), 3),
+            "r_at_target": round(r_target, 4)}
+
+
+def verdict(mc, net_r):
+    """One line from the numbers, judged against break-even after costs."""
+    pt, ps = mc["p_target"], mc["p_stop"]
+    if pt + ps <= 0:
+        return "No replay reached the target or the stop: the price at the end decides every one."
+    share, even = pt / (pt + ps), 1.0 / (1.0 + max(net_r, 0.01))
+    d = share - even
+    if abs(d) < COIN_FLIP:
+        head = "Close to break-even"
+    elif abs(d) < STRONG:
+        head = "Leans toward the target" if d > 0 else "Leans toward the stop"
+    else:
+        head = "Strongly toward the target" if d > 0 else "Strongly toward the stop"
+    return "%s: after costs the target has to come first in %.0f %% of the replays that hit one side; it did in %.0f %%." % (head, 100 * even, 100 * share)
+
+
+def cmd_timemachine(a, cfg):
+    plan = read_json(PLAN)
+    now = pkt_now(a)
+    day = datetime.date.fromisoformat(plan["day"])
+    created = datetime.datetime.strptime(plan["created_pkt"], "%Y-%m-%d %H:%M")
+    start = max(now, created) if now.date() == day else created
+    until = hm(a.until) if a.until else (hm(plan["flat_by"]) if plan.get("flat_by") else None)
+    if until is None:
+        raise PsxError("the PSX is closed on the plan's day")
+    stop_at = datetime.datetime.combine(day, until)
+    width = datetime.timedelta(minutes=BAR_MINUTES)
+    minutes = [minute_of(t) for t in session_slots(day, cfg) if t >= start and t + width <= stop_at]
+    if not minutes:
+        raise PsxError("no candles left between %s and %s to replay" % (start.strftime("%H:%M"), until.strftime("%H:%M")))
+    first = datetime.datetime.combine(day, datetime.time(0, 0))
+    got = get_candles([plan["symbol"]], first - datetime.timedelta(days=95), first, offline=a.offline).get(plan["symbol"])
+    if not got:
+        raise PsxError("pyPSX has no candles for %s" % plan["symbol"])
+    sessions = full_sessions(got["bars"], day, cfg)
+    if len(sessions) < MIN_SESSIONS:
+        raise PsxError("only %d full sessions for %s: too thin to replay (%d needed)" % (len(sessions), plan["symbol"], MIN_SESSIONS))
+    mc = simulate(build_pool(sessions), plan["entry"], plan["stop"], plan["target"], minutes, a.replays, a.seed, a.window)
+    past = [b for d in sessions.values() for b in d]
+    hist = replay(past, a.or_minutes, plan["reward_risk"], cfg)
+    text = verdict(mc, plan["reward_risk_after_costs"])
+    doc = {"plan": plan, "mc": mc, "history": hist, "sessions": len(sessions), "verdict": text, "gaps": got.get("gaps")}
+    if a.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print("%s: entry %.2f, stop %.2f, target %.2f. %s replays of %d candles to %s, from %d full sessions, seed %d." % (
+            plan["symbol"], plan["entry"], plan["stop"], plan["target"], format(mc["replays"], ","), mc["bars_left"], until.strftime("%H:%M"), len(sessions), mc["seed"]))
+        print("  Target first %.1f %%, stop first %.1f %%, neither %.1f %%." % (100 * mc["p_target"], 100 * mc["p_stop"], 100 * mc["p_neither"]))
+        print("  Price at the end: median %.2f, 5th to 95th percentile %.2f to %.2f. Average %+.3f R before costs." % (mc["median_close"], mc["p5_close"], mc["p95_close"], mc["avg_R"]))
+        print("  On those real sessions the breakout fired %d times, with a stop at the range midpoint and a %gR target: target %d, stop %d, neither %d." % (
+            hist["fired"], plan["reward_risk"], hist["target"], hist["stop"], hist["neither"]))
+        print(text)
+        if mc["p_neither"] > MANY_NEITHER:
+            print("%.1f %% of the replays hit neither: the price at the end decides those." % (100 * mc["p_neither"]))
+        print("A simulation from past candles, not a prediction. It cannot see a halt, a locked stock or a headline, and a real stop can fill worse.")
+    if a.write:
+        write_json(TIMEMACHINE_FILE, doc)
+    return 0
+
+
+def cmd_close(a, cfg):
+    """The ticket to get out. Getting out is never blocked by a limit."""
+    order = read_json(ORDERS)
+    print("TICKET TO CLOSE. Nothing is sent: type it into your broker's app yourself.")
+    print("  SELL %d %s at the market or your limit, by %s Pakistan time." % (order["qty"], order["symbol"], order.get("flat_by") or "the close"))
+    print("  Cancel any open stop or target order for it first, so the shares are not sold twice.")
+    return 0
+
+
+def load_alerts():
+    return read_json(ALERTS_FILE, {"alerts": []})
+
+
+def add_alert(doc, **fields):
+    fields["id"] = "-".join(str(fields[k]).lower().replace(" ", "-") for k in ("symbol", "kind", "level") if fields.get(k) not in (None, ""))
+    if any(x["id"] == fields["id"] and not x.get("rang") for x in doc["alerts"]):
+        return False
+    doc["alerts"].append(fields)
+    return True
+
+
+def cmd_alert_add(a, cfg):
+    now = pkt_now(a)
+    stamp, doc, added = now.strftime("%Y-%m-%d %H:%M"), load_alerts(), []
+    base = {"created_pkt": stamp, "rang": None}
+    if a.from_plan:
+        plan = read_json(PLAN)
+        sym, day = plan["symbol"], plan["day"]
+        specs = [dict(symbol=sym, kind="stop", level=plan["stop"], day=day),
+                 dict(symbol=sym, kind="target", level=plan["target"], day=day)]
+        if plan.get("flat_by"):
+            specs.append(dict(symbol=sym, kind="time", level=plan["flat_by"], day=day, label="flat by"))
+    elif a.opening_bell:
+        specs = [dict(kind="bell", level="", symbol="psx", day=now.date().isoformat())]
+    elif a.at:
+        hm(a.at)
+        specs = [dict(kind="time", level=a.at, symbol="", day=now.date().isoformat(), label=a.label or "reminder")]
+    elif a.symbol and (a.above is not None or a.below is not None):
+        sym = clean_symbol(a.symbol)
+        specs = []
+        if a.above is not None:
+            specs.append(dict(symbol=sym, kind="above", level=a.above, day=None))
+        if a.below is not None:
+            specs.append(dict(symbol=sym, kind="below", level=a.below, day=None))
+    else:
+        raise PsxError("use --from-plan, --opening-bell, --at HH:MM, or --symbol with --above or --below")
+    for spec in specs:
+        if add_alert(doc, **dict(base, **spec)):
+            added.append(doc["alerts"][-1]["id"])
+    write_json(ALERTS_FILE, doc)
+    print("Added: %s." % (", ".join(added) or "nothing new"))
+    return 0
+
+
+def alert_hit(alert, bars):
+    """The first candle since the alert was made that crossed its level, or None."""
+    made = datetime.datetime.strptime(alert["created_pkt"], "%Y-%m-%d %H:%M")
+    for b in bars:
+        if b["t"] + datetime.timedelta(minutes=BAR_MINUTES) <= made:
+            continue
+        if alert["kind"] in ("above", "target") and b["high"] >= alert["level"]:
+            return b
+        if alert["kind"] in ("below", "stop") and b["low"] <= alert["level"]:
+            return b
+    return None
+
+
+def cmd_alert_check(a, cfg):
+    now = pkt_now(a)
+    today = now.date().isoformat()
+    doc = load_alerts()
+    live = [x for x in doc["alerts"] if not x.get("rang") and x.get("day") in (None, today)]
+    symbols = sorted({x["symbol"] for x in live if x["kind"] in ("above", "below", "stop", "target")})
+    data = get_candles(symbols, *day_span(now), offline=a.offline) if symbols else {}
+    rung = []
+    for x in live:
+        if x["kind"] == "time":
+            if now.time() >= hm(x["level"]):
+                rung.append((x, "%s: %s %s" % (x["level"], x.get("label", "reminder"), x["symbol"]), x["level"]))
+        elif x["kind"] == "bell":
+            if any(a_ <= now.time() < b_ for a_, b_ in sessions_for(now.date(), cfg)):
+                rung.append((x, "the PSX is open", ""))
+        else:
+            bars = regular_bars(complete_bars((data.get(x["symbol"]) or {"bars": []})["bars"], now.date(), now), now.date(), cfg)
+            hit = alert_hit(x, bars)
+            if hit:
+                rung.append((x, "%s %s %.2f in the %s candle (high %.2f, low %.2f)" % (x["symbol"], x["kind"], x["level"], hit["t"].strftime("%H:%M"), hit["high"], hit["low"]), hit["t"].strftime("%H:%M")))
+    # what happened first prints first: a target at 14:40 comes before a stop at 16:25
+    rung.sort(key=lambda r: r[2])
+    for x, message, _when in rung:
+        x["rang"] = now.strftime("%Y-%m-%d %H:%M")
+        print("RING  " + message)
+    if not rung:
+        print("Nothing rang (%d alerts live)." % len(live))
+    for sym in symbols:
+        bars = regular_bars(complete_bars((data.get(sym) or {"bars": []})["bars"], now.date(), now), now.date(), cfg)
+        print("%s: %s." % (sym, age_line(bars, now)))
+    print("An alert is information, never an order: nothing was sold. Candles can lag, so confirm on your broker's screen.")
+    write_json(ALERTS_FILE, doc)
+    return 0 if rung else 1
+
+
+def cmd_alert_list(a, cfg):
+    doc = load_alerts()
+    for x in doc["alerts"]:
+        print("  %-28s %s" % (x["id"], "rang " + x["rang"] if x.get("rang") else "live"))
+    if not doc["alerts"]:
+        print("No alerts.")
+    return 0
+
+
+def cmd_alert_reset(a, cfg):
+    doc = load_alerts()
+    found = [x for x in doc["alerts"] if x["id"] == a.id]
+    if not found:
+        raise PsxError("no alert called %s" % a.id)
+    for x in found:
+        x["rang"] = None
+    write_json(ALERTS_FILE, doc)
+    print("Reset %s." % a.id)
+    return 0
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Pakistan Stock Exchange tools (trader-psx). Never places an order.")
+    ap = argparse.ArgumentParser(description="The engine behind the psx-* skills. Never places an order.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
@@ -1286,7 +1653,7 @@ def main(argv=None):
     common(sub.add_parser("clock", help="is the PSX open?"))
     p = common(sub.add_parser("scan", help="daily setups from Yahoo's daily bars"))
     p.add_argument("--symbols", help="OGDC,HBL,LUCK instead of the universe file")
-    p.add_argument("--universe", default=UNIVERSE)
+    p.add_argument("--universe")
     p.add_argument("--min-price", type=float, default=1.0)
     p.add_argument("--min-volume", type=int, default=100000)
     p.add_argument("--show", type=int, default=15)
@@ -1295,16 +1662,16 @@ def main(argv=None):
     p = common(sub.add_parser("news", help="Pakistani business RSS feeds"))
     p.add_argument("--tickers", help="OGDC,HBL. Default: the plan and the watchlist")
     p.add_argument("--hours", type=float, default=24)
-    p.add_argument("--universe", default=UNIVERSE)
+    p.add_argument("--universe")
     p.add_argument("--all", action="store_true", help="show items already seen")
     p.add_argument("--no-market", action="store_true", help="only items naming a ticker")
     p.add_argument("--dry-run", action="store_true", help="leave the seen list alone")
     p.add_argument("--offline", metavar="DIR", help="a folder of saved feeds")
     p = common(sub.add_parser("plan", help="set the stop and target"))
-    p.add_argument("symbol")
+    p.add_argument("symbol", nargs="?", help="default: the symbol in today's entry")
     p.add_argument("--entry", type=float, help="the live price on your broker's screen")
-    p.add_argument("--stop", default="atr", help="atr, atr:1.5, pct:2 or price:295.50")
-    p.add_argument("--target", default="1R", help="1R, 2R or price:310")
+    p.add_argument("--stop", help="or-mid (the default after a triggered entry), atr, atr:1.5, pct:2 or price:295.50")
+    p.add_argument("--target", default="2R", help="2R, 1R or price:310")
     p.add_argument("--offline", metavar="DIR")
     p.add_argument("--write", action="store_true")
     p = common(sub.add_parser("size", help="whole shares inside your limits"))
@@ -1319,28 +1686,67 @@ def main(argv=None):
     p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
     p = common(sub.add_parser("orb", help="opening-range breakouts so far (needs a pyPSX key)"))
     p.add_argument("--symbols", help="OGDC,HBL. Default: the universe file")
-    p.add_argument("--universe", default=UNIVERSE)
+    p.add_argument("--universe")
     p.add_argument("--at", help="cut the clock at this time today, like 10:15")
+    p.add_argument("--watchlist", action="store_true", help="only the symbols in trader/psx_watchlist.json")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--show", type=int, default=20)
     p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
     p.add_argument("--no-write", action="store_true")
-    p = common(sub.add_parser("entry", help="waiting, triggered or expired (needs a pyPSX key)"))
+    p = common(sub.add_parser("watch", help="check bar by bar until it triggers (needs a pyPSX key)"))
     p.add_argument("symbol")
+    p.add_argument("--every", type=int, default=60)
+    p.add_argument("--max-minutes", type=int, default=120)
+    p.add_argument("--at", help=argparse.SUPPRESS)
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+    p = common(sub.add_parser("entry", help="waiting, triggered or expired (needs a pyPSX key)"))
+    p.add_argument("symbol", nargs="?")
+    p.add_argument("--watchlist", action="store_true", help="every symbol in trader/psx_watchlist.json")
     p.add_argument("--at", help="cut the clock at this time today, like 10:15")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
     p = common(sub.add_parser("history", help="the breakout rule on past sessions (needs a pyPSX key)"))
     p.add_argument("symbol")
     p.add_argument("--days", type=int, default=60)
-    p.add_argument("--target", default="1R")
+    p.add_argument("--target", default="2R")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+
+    p = common(sub.add_parser("universe", help="every symbol from pyPSX -> trader/psx_universe.txt"))
+    p.add_argument("--offline", metavar="FILE")
+    p = common(sub.add_parser("timemachine", help="10,000 replays of the plan (needs a pyPSX key)"))
+    p.add_argument("--at", help="replay from this time today")
+    p.add_argument("--until", help="end each replay at this time. Default: the plan's flat-by")
+    p.add_argument("--replays", type=int, default=10000)
+    p.add_argument("--seed", type=int, default=19)
+    p.add_argument("--window", type=int, default=2)
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+    p.add_argument("--write", action="store_true")
+    common(sub.add_parser("close", help="the ticket to get out of the order"))
+    p = common(sub.add_parser("alert-add", help="add alerts"))
+    p.add_argument("--from-plan", action="store_true", help="stop, target and flat by from the plan")
+    p.add_argument("--opening-bell", action="store_true")
+    p.add_argument("--symbol")
+    p.add_argument("--above", type=float)
+    p.add_argument("--below", type=float)
+    p.add_argument("--at", help="a time today, like 15:25")
+    p.add_argument("--label")
+    p = common(sub.add_parser("alert-check", help="ring what hit, once"))
+    p.add_argument("--at", help=argparse.SUPPRESS)
+    p.add_argument("--offline", metavar="FILE")
+    common(sub.add_parser("alert-list", help="list alerts"))
+    p = common(sub.add_parser("alert-reset", help="let an alert ring again"))
+    p.add_argument("id")
 
     a = ap.parse_args(argv)
     commands = {"clock": cmd_clock, "scan": cmd_scan, "news": cmd_news, "plan": cmd_plan,
                 "size": cmd_size, "check": cmd_check, "ticket": cmd_ticket, "record": cmd_record,
-                "intraday": cmd_intraday, "orb": cmd_orb, "entry": cmd_entry, "history": cmd_history}
+                "intraday": cmd_intraday, "orb": cmd_orb, "entry": cmd_entry, "history": cmd_history,
+                "universe": cmd_universe, "watch": cmd_watch, "timemachine": cmd_timemachine, "close": cmd_close,
+                "alert-add": cmd_alert_add, "alert-check": cmd_alert_check, "alert-list": cmd_alert_list,
+                "alert-reset": cmd_alert_reset}
     try:
         return commands[a.cmd](a, load_config(a.config))
     except PsxError as e:

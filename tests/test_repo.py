@@ -8,12 +8,18 @@ from _load import ROOT
 # v2, the day-trading pack: the eleven folders the reel's repo card shows
 SKILLS = ["trader-scanner", "trader-news", "trader-entry", "trader-exit", "trader-timemachine",
           "trader-risk", "trader-budget", "trader-broker", "trader-alerts", "trader-analyst",
-          "trader-pelosi", "trader-psx"]  # trader-psx is this fork's addition
+          "trader-pelosi"]
+# this fork's Pakistan Stock Exchange skills, and the engine they share (not a skill itself)
+PSX_SKILLS = ["psx-scanner", "psx-news", "psx-entry", "psx-exit", "psx-timemachine", "psx-budget",
+              "psx-risk", "psx-broker", "psx-alerts", "psx-analyst"]
+PSX_CORE = "psx-core"
 ABOUT = ("11 Claude skills for day trading: scan thousands of charts, track breaking news, time every "
          "entry and exit, and replay every outcome before you risk a dollar.")
 # skills on the way to an order carry the safety block
 ORDER_PATH = ["trader-scanner", "trader-entry", "trader-exit", "trader-timemachine", "trader-budget",
-              "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts", "trader-psx"]
+              "trader-pelosi", "trader-risk", "trader-broker", "trader-alerts",
+              "psx-scanner", "psx-entry", "psx-exit", "psx-timemachine", "psx-budget", "psx-risk",
+              "psx-broker", "psx-alerts"]
 V1_ONLY = ["trader-copycat", "trader-screener", "trader-tax", "trader-rebalance"]
 
 
@@ -36,11 +42,11 @@ class Repo(unittest.TestCase):
     def test_the_skill_folders_at_the_root(self):
         found = sorted(d for d in os.listdir(ROOT)
                        if os.path.isfile(os.path.join(ROOT, d, "SKILL.md")))
-        self.assertEqual(found, sorted(SKILLS))
+        self.assertEqual(found, sorted(SKILLS + PSX_SKILLS))
 
     def test_root_matches_the_reel(self):
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != "trader")  # trader/ is tool output
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "tests", PSX_CORE] + SKILLS + PSX_SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
@@ -49,6 +55,13 @@ class Repo(unittest.TestCase):
             self.assertRegex(fm, r"description: ", s)
             self.assertGreater(len(fm), 200, "%s description is too thin" % s)
             self.assertGreater(len(text.splitlines()), 60, s)
+
+    def test_psx_skills_call_the_shared_engine(self):
+        for s in PSX_SKILLS:
+            fm, text = frontmatter(os.path.join(ROOT, s, "SKILL.md"))
+            self.assertIn("name: %s\n" % s, fm + "\n", s)
+            self.assertGreater(len(fm), 200, s)
+            self.assertIn("${CLAUDE_SKILL_DIR}/../psx-core/psx.py", text, s)
 
     def test_order_path_skills_carry_the_safety_rule(self):
         for s in ORDER_PATH:
@@ -78,7 +91,7 @@ class Repo(unittest.TestCase):
                      "/plugin install day-trader-skill@day-trader-skill",
                      "## Fine print"):
             self.assertIn(line, readme)
-        for s in SKILLS:
+        for s in SKILLS + PSX_SKILLS:
             self.assertIn("/" + s, readme, s)
 
     def test_no_em_dashes_and_no_personal_email(self):
@@ -102,7 +115,7 @@ class Repo(unittest.TestCase):
 
     def test_every_tool_runs_on_python_3_8(self):
         # no 3.9+ only modules or syntax in the tools (the README promises 3.8)
-        for s in SKILLS:
+        for s in SKILLS + [PSX_CORE]:
             folder = os.path.join(ROOT, s)
             for f in os.listdir(folder):
                 if not f.endswith(".py"):

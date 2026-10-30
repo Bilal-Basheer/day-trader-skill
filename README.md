@@ -23,30 +23,32 @@ an order on its own. Paper trading is the default.
 
 ## Pakistan Stock Exchange (this fork)
 
-This fork adds one skill, `/trader-psx`, for the Pakistan Stock Exchange. The
-eleven skills below are unchanged and remain US-only. See
-[`trader-psx/SKILL.md`](trader-psx/SKILL.md).
+This fork adds the same path for the Pakistan Stock Exchange, as separate skills with the same
+hand-offs. The eleven skills further down are unchanged and remain US-only.
 
 ```bash
 git clone -b pakistan-market https://github.com/Bilal-Basheer/day-trader-skill.git
-cp -r day-trader-skill/trader-psx ~/.claude/skills/
+cp -r day-trader-skill/psx-* ~/.claude/skills/
 ```
 
-| | |
-| --- | --- |
-| Prices | Yahoo daily bars for `SYMBOL.KA`, free and unofficial |
-| Intraday | 5-minute candles from pyPSX, with your own key (`orb`, `entry`, `history`) |
-| News | Business Recorder, Dawn, Express Tribune and ProPakistani RSS feeds |
-| Clock | PSX regular market in Pakistan time, including the split Friday |
-| Orders | A ticket you type into your own broker's app. It never places an order |
+| command | job | data |
+| --- | --- | --- |
+| `/psx-scanner` | Daily setups and opening-range breakouts | Yahoo daily bars, pyPSX candles |
+| `/psx-news` | News on the watchlist | Business Recorder, Dawn, Express Tribune, ProPakistani RSS |
+| `/psx-entry` | Waiting, triggered or expired, for the watchlist or one stock | pyPSX candles |
+| `/psx-exit` | Stop and target, in rupees, inside the price band | Yahoo daily bars, your live price |
+| `/psx-timemachine` | 10,000 replays plus the past sessions | pyPSX candles |
+| `/psx-budget` | Whole shares inside your rupee limits | your config |
+| `/psx-risk` | PASS or BLOCK | your config |
+| `/psx-broker` | A ticket you type into your own broker's app | none: it cannot place an order |
+| `/psx-alerts` | Stop, target, flat by, price levels | pyPSX candles |
+| `/psx-analyst` | Results from news and reports you provide | RSS feeds, your documents |
 
-**Without a pyPSX key it is daily only.** With one you get 5-minute candles, but
-pyPSX is a third party whose docs state no terms, delay figure or PSX licence, so
-check its candles against your broker before relying on them. There is no PSX
-version of the Time Machine's 10,000 replays: `history` counts past sessions instead.
-It does not read the PSX Data Portal, because that site's terms ban automated tools
-without PSX's written permission. Holidays, the price band and trading costs need
-checking in your config: the table in the SKILL.md says which rules are confirmed.
+There is no PSX version of `/trader-pelosi`. Intraday steps need your own pyPSX key in
+`PYPSX_API_KEY_ID` and `PYPSX_API_SECRET_KEY`. pyPSX is a third party whose docs state no terms, delay
+figure or PSX licence, so check its candles against your broker before relying on them. The pack does
+not read the PSX Data Portal, because that site's terms ban automated tools without PSX's written
+permission. Holidays, the price band and trading costs need checking in `trader/psx_config.json`.
 
 ## Install
 
@@ -237,7 +239,8 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
-trader-psx/         SKILL.md, psx.py, psx_universe.txt, psx_config.example.json (this fork)
+psx-core/           psx.py, psx_universe.txt, psx_config.example.json (this fork's shared engine)
+psx-*/              SKILL.md, one per PSX step (this fork)
 tests/              unittest suite + offline fixtures
 ```
 

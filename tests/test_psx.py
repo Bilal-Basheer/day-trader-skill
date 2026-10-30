@@ -1,4 +1,4 @@
-"""trader-psx. Every price here is made up: real PSX data is licensed, so none is committed."""
+"""The psx-* skills. Every price here is made up: real PSX data is licensed, so none is committed."""
 
 import contextlib
 import datetime
@@ -10,7 +10,7 @@ import unittest
 
 from _load import ROOT, load
 
-psx = load("trader-psx", "psx")
+psx = load("psx-core", "psx")
 CFG = dict(psx.DEFAULTS)
 
 
@@ -132,7 +132,7 @@ class Bars(unittest.TestCase):
         self.assertEqual(psx.symbol_list("OGDC, hbl LUCK"), ["OGDC", "HBL", "LUCK"])
 
     def test_the_universe_file(self):
-        rows = psx.read_universe()
+        rows = psx.read_universe(psx.UNIVERSE)
         self.assertEqual(len(rows), 60)
         self.assertIn(("HBL", "Habib Bank Limited"), rows)
         self.assertNotIn("HUBC", dict(rows))
@@ -182,7 +182,7 @@ RSS = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Feed</title>
 class News(unittest.TestCase):
     def pick(self, tickers=("HBL", "OGDC", "POL"), seen=None, market=True, hours=24):
         items = psx.parse_feed(RSS, "Test")
-        match = psx.matchers(psx.read_universe(), list(tickers))
+        match = psx.matchers(psx.read_universe(psx.UNIVERSE), list(tickers))
         return psx.select_news(items, match, utc("2026-10-30 12:00"), hours, seen, market)
 
     def test_parse_reads_a_two_digit_year_and_entities(self):
@@ -204,12 +204,12 @@ class News(unittest.TestCase):
         self.assertEqual(len(self.pick(hours=24 * 30)), 3)
 
     def test_an_ambiguous_ticker_matches_only_its_name(self):
-        match = psx.matchers(psx.read_universe(), ["POL"])
+        match = psx.matchers(psx.read_universe(psx.UNIVERSE), ["POL"])
         self.assertFalse(match[0][1].search("POL rises"))
         self.assertTrue(match[0][1].search("Pakistan Oilfields rises"))
 
     def test_generic_words_do_not_match_a_company(self):
-        match = dict(psx.matchers(psx.read_universe(), ["PPL", "SYS", "NBP", "TRG"]))
+        match = dict(psx.matchers(psx.read_universe(psx.UNIVERSE), ["PPL", "SYS", "NBP", "TRG"]))
         self.assertFalse(match["PPL"].search("Petroleum prices rise"))
         self.assertTrue(match["PPL"].search("Pakistan Petroleum finds gas"))
         self.assertFalse(match["SYS"].search("New payment systems launched"))
@@ -539,11 +539,11 @@ class IntradayCli(unittest.TestCase):
         code, text = self.run_cli("entry", "OGDC", *now)
         self.assertEqual(code, 0)
         self.assertIn("TRIGGERED at 09:50", text)
-        self.assertIn("--stop price:100.50", text)
+        self.assertIn("range low 99.00", text)
         code, text = self.run_cli("orb", "--symbols", "OGDC,NOPE", *now)
         self.assertEqual(code, 0)
         self.assertIn("1 of 2 charts usable (1 no data", text)
-        self.assertTrue(os.path.exists(psx.ORB_FILE))
+        self.assertEqual(json.load(open(psx.WATCHLIST))["mode"], "orb")
         code, text = self.run_cli("intraday", "OGDC", *now)
         self.assertIn("newest candle closed 09:50, 10 minutes before", text)
 
@@ -559,9 +559,223 @@ class IntradayCli(unittest.TestCase):
             self.assertNotIn(word, text)
 
 
+def full_day(day, seed, base=100.0):
+    rng = __import__("random").Random(seed)
+    rows, p = [], base
+    for t in psx.session_slots(day, CFG):
+        c = p * (1 + rng.uniform(-0.003, 0.003))
+        rows.append(["%s+05:00" % t.isoformat(), p, max(p, c) * 1.001, min(p, c) * 0.999, c, 1000])
+        p = c
+    return rows
+
+
+def history_doc(days):
+    rows = []
+    for i, d in enumerate(days):
+        rows.extend(full_day(d, i))
+    return {"results": [{"symbol": "OGDC", "candles": rows, "gaps": [], "note": None}]}
+
+
+class TimeMachine(unittest.TestCase):
+    def setUp(self):
+        self.days = weekdays(THU - datetime.timedelta(days=1), 30)
+        self.bars = psx.parse_candles(history_doc(self.days))["OGDC"]["bars"]
+        self.sessions = psx.full_sessions(self.bars, THU, CFG)
+        self.pool = psx.build_pool(self.sessions)
+        self.mins = [psx.minute_of(t) for t in psx.session_slots(THU, CFG) if t >= at(THU, "10:00") and t < at(THU, "15:25")]
+
+    def run_it(self, seed=19, replays=2000):
+        return psx.simulate(self.pool, 100.0, 99.0, 102.0, self.mins, replays, seed)
+
+    def test_slots_follow_the_session(self):
+        self.assertEqual(len(psx.session_slots(THU, CFG)), 72)
+        fri = [t.strftime("%H:%M") for t in psx.session_slots(FRI, CFG)]
+        self.assertEqual((fri[0], fri[-1]), ("09:15", "16:25"))
+        self.assertNotIn("13:00", fri)
+        self.assertEqual(psx.session_slots(datetime.date(2026, 10, 31), CFG), [])
+
+    def test_only_full_sessions_are_kept(self):
+        self.assertEqual(len(self.sessions), 30)
+        partial = [b for b in self.bars if not (b["t"].date() == self.days[0] and b["t"].hour == 11)]
+        self.assertEqual(len(psx.full_sessions(partial, THU, CFG)), 29)
+        self.assertEqual(len(psx.full_sessions(self.bars, THU, CFG, keep=10)), 10)
+
+    def test_the_plans_day_is_never_in_the_pool(self):
+        self.assertNotIn(self.days[-1], psx.full_sessions(self.bars, self.days[-1], CFG))
+
+    def test_same_seed_same_numbers(self):
+        self.assertEqual(self.run_it(), self.run_it())
+        self.assertNotEqual(self.run_it(seed=19), self.run_it(seed=20))
+
+    def test_the_odds_add_up(self):
+        mc = self.run_it()
+        self.assertAlmostEqual(mc["p_target"] + mc["p_stop"] + mc["p_neither"], 1.0, places=3)
+        self.assertLessEqual(mc["p5_close"], mc["median_close"])
+        self.assertLessEqual(mc["median_close"], mc["p95_close"])
+
+    def test_a_candle_touching_both_counts_as_the_stop(self):
+        pool = {600: [(1.05, 0.95, 1.0)]}
+        mc = psx.simulate(pool, 100.0, 99.0, 102.0, [600], 50, window=0)
+        self.assertEqual(mc["p_stop"], 1.0)
+
+    def test_the_verdict_is_judged_after_costs(self):
+        even = {"p_target": 0.25, "p_stop": 0.25}
+        self.assertIn("break-even", psx.verdict(even, 1.0))
+        self.assertIn("toward the stop", psx.verdict({"p_target": 0.2, "p_stop": 0.8}, 1.0))
+        self.assertIn("Strongly toward the target", psx.verdict({"p_target": 0.8, "p_stop": 0.2}, 1.0))
+        self.assertIn("No replay", psx.verdict({"p_target": 0, "p_stop": 0}, 1.0))
+
+
+class Pipeline(unittest.TestCase):
+    """The hand-offs: scanner -> entry -> exit -> timemachine -> budget -> risk -> broker -> alerts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, self.cwd)
+        os.mkdir("charts")
+        with open(os.path.join("charts", "OGDC.json"), "w") as fh:
+            json.dump(chart(weekdays(END, 30), [100.0 + (i % 5) for i in range(30)]), fh)
+        today = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 103.5, 102.8, 103.2)]
+        with open("today.json", "w") as fh:
+            json.dump(candle_doc("OGDC", [THU], lambda d: today), fh)
+        with open("past.json", "w") as fh:
+            json.dump(history_doc(weekdays(THU - datetime.timedelta(days=1), 30)), fh)
+
+    def cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = psx.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def test_no_ticker_after_the_pick(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.assertEqual(self.cli("orb", "--symbols", "OGDC", "--offline", "today.json", *now)[0], 0)
+        code, text = self.cli("entry", "--watchlist", "--offline", "today.json", *now)
+        self.assertEqual(code, 0, text)
+        self.assertIn("1 of 1 triggered", text)
+        self.assertEqual(self.cli("entry", "OGDC", "--offline", "today.json", *now)[0], 0)
+        # no symbol, and the stop comes from the opening range: 99 to 102
+        code, text = self.cli("plan", "--entry", "103.5", "--offline", "charts", "--write", *now)
+        self.assertEqual(code, 0, text)
+        plan = json.load(open(psx.PLAN))
+        self.assertEqual((plan["symbol"], plan["stop"], plan["target"], plan["stop_rule"]), ("OGDC", 100.5, 109.5, "or-mid"))
+        code, text = self.cli("timemachine", "--offline", "past.json", "--replays", "500", "--write", *now)
+        self.assertEqual(code, 0, text)
+        self.assertIn("Target first", text)
+        self.assertIn("after costs", text)
+        self.assertTrue(os.path.exists(psx.TIMEMACHINE_FILE))
+        self.assertEqual(self.cli("size", "--write", *now)[0], 0)
+        self.assertEqual(self.cli("check", *now)[0], 0)
+        self.assertEqual(self.cli("ticket", *now)[0], 0)
+        self.assertIn("Added", self.cli("alert-add", "--from-plan", *now)[1])
+
+    def test_no_entry_and_no_symbol_is_a_plain_error(self):
+        code, text = self.cli("plan", "--now", "2026-10-29 10:05")
+        self.assertEqual(code, 1)
+        self.assertIn("/psx-entry", text)
+
+    def test_yesterdays_entry_is_not_reused(self):
+        self.cli("entry", "OGDC", "--offline", "today.json", "--now", "2026-10-29 10:05")
+        code, text = self.cli("plan", "--now", "2026-10-30 10:05")
+        self.assertEqual(code, 1)
+
+    def test_an_estimated_entry_is_still_blocked(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.cli("entry", "OGDC", "--offline", "today.json", *now)
+        code, text = self.cli("plan", "--offline", "charts", "--write", *now)
+        self.assertIn("breakout candle", text)
+        self.cli("size", "--write", *now)
+        self.assertEqual(self.cli("check", *now)[0], 1)
+
+    def test_a_thin_history_is_refused(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.cli("entry", "OGDC", "--offline", "today.json", *now)
+        self.cli("plan", "--entry", "103.5", "--offline", "charts", "--write", *now)
+        with open("thin.json", "w") as fh:
+            json.dump(history_doc(weekdays(THU - datetime.timedelta(days=1), 5)), fh)
+        code, text = self.cli("timemachine", "--offline", "thin.json", *now)
+        self.assertEqual(code, 1)
+        self.assertIn("too thin", text)
+
+    def test_alerts_ring_once(self):
+        now = ["--now", "2026-10-29 10:05"]
+        made = ["--now", "2026-10-29 09:40"]
+        self.cli("alert-add", "--symbol", "OGDC", "--above", "103.8", *made)
+        self.cli("alert-add", "--symbol", "OGDC", "--below", "50", *made)
+        self.cli("alert-add", "--at", "10:00", "--label", "check in", *made)
+        code, text = self.cli("alert-check", "--offline", "today.json", *now)
+        self.assertEqual(code, 0, text)
+        self.assertIn("RING  OGDC above 103.80", text)
+        self.assertIn("check in", text)
+        self.assertNotIn("below", text.split("An alert")[0].replace("OGDC:", ""))
+        self.assertIn("nothing was sold", text)
+        self.assertEqual(self.cli("alert-check", "--offline", "today.json", *now)[0], 1)
+        self.assertEqual(self.cli("alert-reset", "ogdc-above-103.8")[0], 0)
+        self.assertEqual(self.cli("alert-check", "--offline", "today.json", *now)[0], 0)
+        self.assertIn("live", self.cli("alert-list")[1])
+
+    def test_a_candle_from_before_the_alert_does_not_ring_it(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.cli("alert-add", "--symbol", "OGDC", "--above", "103.8", *now)
+        self.assertEqual(self.cli("alert-check", "--offline", "today.json", *now)[0], 1)
+
+    def test_plan_alerts_only_ring_on_the_plans_day(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.cli("entry", "OGDC", "--offline", "today.json", *now)
+        self.cli("plan", "--entry", "103.5", "--offline", "charts", "--write", *now)
+        self.cli("alert-add", "--from-plan", *now)
+        code, text = self.cli("alert-check", "--now", "2026-10-30 10:05")
+        self.assertEqual(code, 1)
+        self.assertIn("0 alerts live", text)
+
+    def test_the_closing_ticket(self):
+        now = ["--now", "2026-10-29 10:05"]
+        self.cli("entry", "OGDC", "--offline", "today.json", *now)
+        self.cli("plan", "--entry", "103.5", "--offline", "charts", "--write", *now)
+        self.cli("size", "--write", *now)
+        code, text = self.cli("close", *now)
+        self.assertEqual(code, 0)
+        self.assertIn("SELL", text)
+        self.assertIn("Nothing is sent", text)
+
+    def test_the_universe_comes_from_the_symbol_list(self):
+        with open("symbols.json", "w") as fh:
+            json.dump({"symbols": [{"symbol": "OGDC", "name": "Oil and Gas Development Company Limited"},
+                                   {"symbol": "HUBC", "name": "Hub Power"}, {"symbol": "MZNPETF", "name": "Meezan ETF"}]}, fh)
+        code, text = self.cli("universe", "--offline", "symbols.json")
+        self.assertEqual(code, 0)
+        self.assertEqual([s for s, _ in psx.read_universe()], ["OGDC", "HUBC"])
+
+    def test_scans_use_the_full_universe_once_it_exists(self):
+        with open("symbols.json", "w") as fh:
+            json.dump({"symbols": [{"symbol": "OGDC", "name": "Oil and Gas"}, {"symbol": "HUBC", "name": "Hub Power"}]}, fh)
+        self.cli("universe", "--offline", "symbols.json")
+        code, text = self.cli("orb", "--offline", "today.json", "--now", "2026-10-29 10:05")
+        self.assertIn("of 2 charts usable", text)
+
+    def test_alerts_print_in_the_order_they_happened(self):
+        rows = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 103.5, 100.5, 101)]
+        with open("order.json", "w") as fh:
+            json.dump(candle_doc("OGDC", [THU], lambda d: rows), fh)
+        made = ["--now", "2026-10-29 09:45"]
+        self.cli("alert-add", "--symbol", "OGDC", "--below", "100.8", *made)  # added first, hits second
+        self.cli("alert-add", "--symbol", "OGDC", "--above", "103.8", *made)
+        _, text = self.cli("alert-check", "--offline", "order.json", "--now", "2026-10-29 10:05")
+        self.assertLess(text.index("above"), text.index("below"))
+
+    def test_watch_stops_when_the_clock_is_pinned(self):
+        code, text = self.cli("watch", "OGDC", "--offline", "today.json", "--now", "2026-10-29 10:05")
+        self.assertEqual(code, 0)
+        self.assertIn("TRIGGERED", text)
+        self.assertEqual(self.cli("watch", "OGDC", "--every", "1")[0], 1)
+
+
 class Limits(unittest.TestCase):
     def test_it_cannot_place_an_order_or_read_the_portal(self):
-        with open(os.path.join(ROOT, "trader-psx", "psx.py"), encoding="utf-8") as fh:
+        with open(os.path.join(ROOT, "psx-core", "psx.py"), encoding="utf-8") as fh:
             src = fh.read()
         code = src.split('"""', 2)[2]  # past the docstring, which names the portal to say why not
         self.assertNotIn("place_stock_order", code)
@@ -572,7 +786,7 @@ class Limits(unittest.TestCase):
         self.assertNotIn("POST", code)
 
     def test_no_real_market_data_is_committed(self):
-        self.assertFalse(os.path.exists(os.path.join(ROOT, "tests", "fixtures", "trader-psx")))
+        self.assertFalse(os.path.exists(os.path.join(ROOT, "tests", "fixtures", "psx-core")))
 
 
 if __name__ == "__main__":
