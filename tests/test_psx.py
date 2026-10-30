@@ -412,6 +412,138 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+def candle_doc(sym, days, make):
+    """pyPSX's documented shape. make(day) -> [(HH:MM, o, h, l, c)]."""
+    rows = []
+    for d in days:
+        for hm_, o, h, lo, c in make(d):
+            rows.append(["%sT%s:00+05:00" % (d.isoformat(), hm_), o, h, lo, c, 1000])
+    return {"results": [{"symbol": sym, "interval": "5m", "candles": rows, "gaps": [], "note": None}]}
+
+
+THU = datetime.date(2026, 10, 29)
+FRI = datetime.date(2026, 10, 30)
+OPENING = [("09:30", 100, 101, 99, 100), ("09:35", 100, 102, 99.5, 101), ("09:40", 101, 102, 100, 101)]  # high 102, low 99
+
+
+def bars_of(rows, day=THU):
+    return psx.parse_candles(candle_doc("OGDC", [day], lambda d: rows))["OGDC"]["bars"]
+
+
+def at(day, text):
+    return datetime.datetime.combine(day, datetime.datetime.strptime(text, "%H:%M").time())
+
+
+class Intraday(unittest.TestCase):
+    def st(self, rows, when, day=THU, cfg=CFG):
+        return psx.orb_status(bars_of(rows, day), at(day, when), 15, cfg)
+
+    def test_times_become_pakistan_time(self):
+        doc = {"results": [{"symbol": "X", "candles": [["2026-10-29T04:30:00Z", 1, 2, 0.5, 1.5, 9]]}]}
+        self.assertEqual(psx.parse_candles(doc)["X"]["bars"][0]["t"], at(THU, "09:30"))
+
+    def test_a_changed_shape_is_one_plain_error(self):
+        with self.assertRaises(psx.PsxError):
+            psx.parse_candles({"candles": []})
+
+    def test_forming_waiting_triggered(self):
+        self.assertEqual(self.st(OPENING, "09:40")["status"], "forming")
+        rows = OPENING + [("09:45", 101, 101.5, 100, 101.2)]
+        self.assertEqual(self.st(rows, "09:50")["status"], "waiting")
+        rows = rows + [("09:50", 101, 104, 101, 103)]
+        got = self.st(rows, "09:55")
+        self.assertEqual((got["status"], got["price"], got["at"], got["or_high"], got["or_low"]), ("triggered", 103.0, "09:55", 102.0, 99.0))
+
+    def test_a_high_above_the_range_is_not_a_close_above_it(self):
+        rows = OPENING + [("09:45", 101, 105, 100, 101.9)]
+        self.assertEqual(self.st(rows, "09:50")["status"], "waiting")
+
+    def test_a_candle_still_forming_does_not_count(self):
+        rows = OPENING + [("09:45", 101, 104, 101, 103)]
+        self.assertEqual(self.st(rows, "09:49")["status"], "waiting")
+        self.assertEqual(self.st(rows, "09:50")["status"], "triggered")
+
+    def test_a_missing_opening_candle_is_unusable(self):
+        self.assertEqual(self.st(OPENING[:2], "10:00")["status"], "unusable")
+
+    def test_friday_opens_earlier(self):
+        rows = [("09:15", 100, 101, 99, 100), ("09:20", 100, 102, 99.5, 101), ("09:25", 101, 102, 100, 101), ("09:30", 101, 104, 101, 103)]
+        got = self.st(rows, "09:35", day=FRI)
+        self.assertEqual((got["status"], got["at"]), ("triggered", "09:35"))
+
+    def test_expired_and_closed(self):
+        self.assertEqual(self.st(OPENING, "15:00")["status"], "expired")
+        self.assertEqual(psx.orb_status([], at(datetime.date(2026, 10, 31), "10:00"), 15, CFG)["status"], "closed")
+
+    def test_or_minutes_must_fit_the_grid(self):
+        with self.assertRaises(psx.PsxError):
+            psx.orb_status([], at(THU, "10:00"), 7, CFG)
+
+    def test_replay_counts_only(self):
+        win = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 106, 103, 105.5)]     # entry 103, stop 100.5, target 105.5
+        lose = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 103, 100, 100.2)]
+        both = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 106, 100, 103)]
+        quiet = OPENING + [("09:45", 101, 101.5, 100, 101)]
+        idle = OPENING + [("09:45", 101, 104, 101, 103), ("09:50", 103, 103.5, 102.5, 103)]
+        days = {datetime.date(2026, 10, 26): win, datetime.date(2026, 10, 27): lose, datetime.date(2026, 10, 28): both,
+                datetime.date(2026, 10, 29): quiet, datetime.date(2026, 10, 22): idle}
+        doc = candle_doc("OGDC", sorted(days), lambda d: days[d])
+        c = psx.replay(psx.parse_candles(doc)["OGDC"]["bars"], 15, 1.0, CFG)
+        self.assertEqual(c, {"sessions": 5, "fired": 4, "target": 1, "stop": 2, "neither": 1})
+
+    def test_no_key_is_one_plain_line(self):
+        saved = {k: os.environ.pop(k, None) for k in ("PYPSX_API_KEY_ID", "PYPSX_API_SECRET_KEY")}
+        try:
+            with self.assertRaises(psx.PsxError) as e:
+                psx.pypsx_get("/x", {})
+            self.assertIn("markets.pypsx.com", str(e.exception))
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+
+class IntradayCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.addCleanup(os.chdir, self.cwd)
+        with open("c.json", "w") as fh:
+            json.dump(candle_doc("OGDC", [THU], lambda d: OPENING + [("09:45", 101, 104, 101, 103)]), fh)
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = psx.main(list(args))
+        return code, out.getvalue() + err.getvalue()
+
+    def test_entry_and_orb_and_intraday(self):
+        now = ["--now", "2026-10-29 10:00", "--offline", "c.json"]
+        code, text = self.run_cli("entry", "OGDC", *now)
+        self.assertEqual(code, 0)
+        self.assertIn("TRIGGERED at 09:50", text)
+        self.assertIn("--stop price:100.50", text)
+        code, text = self.run_cli("orb", "--symbols", "OGDC,NOPE", *now)
+        self.assertEqual(code, 0)
+        self.assertIn("1 of 2 charts usable (1 no data", text)
+        self.assertTrue(os.path.exists(psx.ORB_FILE))
+        code, text = self.run_cli("intraday", "OGDC", *now)
+        self.assertIn("newest candle closed 09:50, 10 minutes before", text)
+
+    def test_at_cuts_the_clock(self):
+        code, text = self.run_cli("entry", "OGDC", "--now", "2026-10-29 15:00", "--at", "09:48", "--offline", "c.json")
+        self.assertEqual(code, 1)
+        self.assertIn("waiting", text)
+
+    def test_history_prints_no_profit_figure(self):
+        code, text = self.run_cli("history", "OGDC", "--now", "2026-10-30 10:00", "--offline", "c.json")
+        self.assertIn("fired 1 times", text)
+        for word in ("profit", "P&L", "return"):
+            self.assertNotIn(word, text)
+
+
 class Limits(unittest.TestCase):
     def test_it_cannot_place_an_order_or_read_the_portal(self):
         with open(os.path.join(ROOT, "trader-psx", "psx.py"), encoding="utf-8") as fh:
@@ -420,6 +552,9 @@ class Limits(unittest.TestCase):
         self.assertNotIn("place_stock_order", code)
         self.assertNotIn("data=", code)
         self.assertNotIn("dps.psx.com.pk", code)
+        self.assertNotIn("/orders", code)
+        self.assertNotIn("api.pypsx.com/v", code)
+        self.assertNotIn("POST", code)
 
     def test_no_real_market_data_is_committed(self):
         self.assertFalse(os.path.exists(os.path.join(ROOT, "tests", "fixtures", "trader-psx")))

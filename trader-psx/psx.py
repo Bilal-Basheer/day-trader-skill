@@ -11,6 +11,12 @@
     python3 psx.py ticket                                 # the ticket to type into your broker's app
     python3 psx.py record                                 # log it once you have placed it
 
+  Intraday, these need a pyPSX key (see SKILL.md):
+    python3 psx.py intraday OGDC                          # today's 5-minute candles and how old they are
+    python3 psx.py orb --symbols OGDC,HBL --at 10:15      # opening-range breakouts so far
+    python3 psx.py entry OGDC                             # waiting / triggered / expired
+    python3 psx.py history OGDC --days 60 --target 1R     # the same rule on past sessions
+
 Data, and why these and no others:
 
   Yahoo chart JSON (SYMBOL.KA)  daily bars only. Yahoo answers a 5-minute request for
@@ -19,6 +25,8 @@ Data, and why these and no others:
                                 old (regularMarketTime 2024-07-24 for OGDC when this was
                                 written), so prices come from the bars, never the meta.
   RSS feeds                     Business Recorder, Dawn, Express Tribune, ProPakistani.
+  pyPSX API, with your own key  5-minute candles, read only (GET). Its docs state no delay
+                                figure and no PSX licence, so every candle's age is printed.
 
   dps.psx.com.pk is deliberately not read. Its terms ban "spiders, robots, avatars,
   agents, tools" without PSX's written permission, and market data licences go through
@@ -41,6 +49,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -65,6 +74,14 @@ ORDERS = "trader/psx_orders.json"
 NEWS_STATE = "trader/state/psx_news.json"
 RISK_STATE = "trader/state/psx_risk.json"
 TRADES_STATE = "trader/state/psx_trades.json"
+ORB_FILE = "trader/psx_orb.json"
+ENTRY_FILE = "trader/psx_entry.json"
+
+# Sandbox host on purpose: this tool only reads market data and has no use for live accounts.
+PYPSX_BASE = "https://paper-api.pypsx.com"
+PYPSX_PAUSE = 1.1    # the docs allow bursts of 20, then 1 request a second per key
+PYPSX_BATCH = 20
+BAR_MINUTES = 5
 
 # psx.com.pk/psx/exchange/general/trading-hours, regular market, read 2026-10-30.
 # Ramadan and other changes go in the config as session_overrides.
@@ -951,6 +968,300 @@ def cmd_record(a, cfg):
     return 0
 
 
+# ---------------------------------------------------------------- intraday, from pyPSX
+
+def pypsx_get(path, params):
+    """One authenticated GET. Keys come from the environment and are never printed."""
+    key, secret = os.environ.get("PYPSX_API_KEY_ID"), os.environ.get("PYPSX_API_SECRET_KEY")
+    if not key or not secret:
+        raise PsxError("intraday data needs a pyPSX key: create one at markets.pypsx.com, then set "
+                       "PYPSX_API_KEY_ID and PYPSX_API_SECRET_KEY in your environment (never in the chat)")
+    base = os.environ.get("PYPSX_BASE", PYPSX_BASE).rstrip("/")
+    req = urllib.request.Request(base + path + "?" + urllib.parse.urlencode(params), headers={
+        "User-Agent": UA, "PYPSX-API-KEY-ID": key, "PYPSX-API-SECRET-KEY": secret})
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+                return resp.read(MAX_BYTES)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1:
+                SLEEP(BACKOFF)
+                continue
+            if e.code in (401, 403):
+                raise PsxError("pyPSX refused the key (HTTP %d): check it, or whether your plan allows this data" % e.code)
+            raise PsxError("pyPSX answered HTTP %d" % e.code)
+        except (urllib.error.URLError, OSError) as e:
+            raise PsxError("could not reach pyPSX: %s" % getattr(e, "reason", e))
+    raise PsxError("pyPSX is rate limiting this key")
+
+
+def parse_stamp_pkt(text):
+    """An ISO candle time -> naive Pakistan time."""
+    dt = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt
+    return dt.replace(tzinfo=None) - dt.utcoffset() + PKT
+
+
+def parse_candles(text_or_doc):
+    """{results: [{symbol, candles: [[time, o, h, l, c, v]], gaps, note}]} -> {SYM: {bars, gaps, note}}."""
+    try:
+        doc = json.loads(text_or_doc) if isinstance(text_or_doc, (str, bytes)) else text_or_doc
+        out = {}
+        for row in doc["results"]:
+            bars = {}
+            for c in row.get("candles") or []:
+                if None in c[:5]:
+                    continue
+                t = parse_stamp_pkt(c[0])
+                bars[t] = {"t": t, "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4]),
+                           "volume": int(c[5] or 0)}
+            out[row["symbol"]] = {"bars": [bars[t] for t in sorted(bars)], "gaps": row.get("gaps") or [],
+                                  "note": row.get("note")}
+        return out
+    except (KeyError, TypeError, ValueError, IndexError):
+        raise PsxError("pyPSX's answer was not in the documented shape: it may have changed")
+
+
+def get_candles(symbols, start, end, offline=None):
+    """5-minute candles for symbols between two Pakistan times, batched to the rate limit."""
+    if offline:
+        with open(offline, encoding="utf-8") as fh:
+            return parse_candles(fh.read())
+    out = {}
+    for i in range(0, len(symbols), PYPSX_BATCH):
+        if i:
+            SLEEP(PYPSX_PAUSE)
+        text = pypsx_get("/api/v1/market/historical-intraday", {
+            "symbol": ",".join(symbols[i:i + PYPSX_BATCH]), "interval": "%dm" % BAR_MINUTES,
+            "from": start.isoformat() + "+05:00", "to": end.isoformat() + "+05:00"})
+        out.update(parse_candles(text))
+    return out
+
+
+def complete_bars(bars, day, now):
+    """One day's candles that have finished by now (Pakistan time)."""
+    width = datetime.timedelta(minutes=BAR_MINUTES)
+    return [b for b in bars if b["t"].date() == day and b["t"] + width <= now]
+
+
+def range_start(day, cfg):
+    """The first candle of the session on the 5-minute grid: 09:32 -> 09:30, 09:17 -> 09:15."""
+    spans = sessions_for(day, cfg)
+    if not spans:
+        return None
+    t = datetime.datetime.combine(day, spans[0][0])
+    return t.replace(minute=t.minute - t.minute % BAR_MINUTES)
+
+
+def orb_status(bars, now, or_minutes, cfg):
+    """Pure. The first completed candle after the opening range to CLOSE above its high.
+    status: closed, forming, unusable, waiting, triggered or expired."""
+    day = now.date()
+    start = range_start(day, cfg)
+    if start is None:
+        return {"status": "closed"}
+    if or_minutes % BAR_MINUTES or or_minutes <= 0:
+        raise PsxError("--or-minutes must be a multiple of %d" % BAR_MINUTES)
+    range_end = start + datetime.timedelta(minutes=or_minutes)
+    done = complete_bars(bars, day, now)
+    in_range = [b for b in done if start <= b["t"] < range_end]
+    if now < range_end:
+        return {"status": "forming", "range_ends": range_end.strftime("%H:%M")}
+    if len(in_range) < or_minutes // BAR_MINUTES:
+        return {"status": "unusable", "reason": "%d of %d opening-range candles are there" % (
+            len(in_range), or_minutes // BAR_MINUTES)}
+    high, low = max(b["high"] for b in in_range), min(b["low"] for b in in_range)
+    out = {"or_high": round(high, 2), "or_low": round(low, 2)}
+    after = [b for b in done if b["t"] >= range_end]
+    out["last"] = round((after or in_range)[-1]["close"], 2)
+    out["last_bar"] = (after or in_range)[-1]["t"].strftime("%H:%M")
+    for b in after:
+        if b["close"] > high:
+            closed = b["t"] + datetime.timedelta(minutes=BAR_MINUTES)
+            out.update(status="triggered", price=round(b["close"], 2), at=closed.strftime("%H:%M"),
+                       over_pct=round((b["close"] / high - 1) * 100, 2))
+            return out
+    spans = sessions_for(day, cfg)
+    last_entry = datetime.datetime.combine(day, spans[-1][1]) - datetime.timedelta(minutes=cfg["no_entries_last_minutes"])
+    out["status"] = "expired" if now >= last_entry else "waiting"
+    return out
+
+
+def replay_day(bars, day, or_minutes, target_r, cfg):
+    """One past session: did the rule fire, and which came first? Stop at the range midpoint.
+    A candle that touches both counts as the stop, the cautious reading."""
+    end = datetime.datetime.combine(day, datetime.time(23, 59))
+    st = orb_status(bars, end, or_minutes, cfg)
+    if st.get("status") != "triggered":
+        return None
+    closed = datetime.datetime.combine(day, datetime.datetime.strptime(st["at"], "%H:%M").time())
+    entry = st["price"]
+    stop = (st["or_high"] + st["or_low"]) / 2.0
+    if stop >= entry:
+        return None
+    target = entry + (entry - stop) * target_r
+    for b in complete_bars(bars, day, end):
+        if b["t"] < closed:
+            continue
+        if b["low"] <= stop:
+            return "stop"
+        if b["high"] >= target:
+            return "target"
+    return "neither"
+
+
+def replay(bars, or_minutes, target_r, cfg):
+    """Pure. Counts only, never a profit figure."""
+    counts = {"sessions": 0, "fired": 0, "target": 0, "stop": 0, "neither": 0}
+    for day in sorted({b["t"].date() for b in bars}):
+        if not sessions_for(day, cfg):
+            continue
+        counts["sessions"] += 1
+        got = replay_day(bars, day, or_minutes, target_r, cfg)
+        if got:
+            counts["fired"] += 1
+            counts[got] += 1
+    return counts
+
+
+def age_line(bars, now):
+    """How old the newest finished candle is: the docs state no delay, so measure it."""
+    if not bars:
+        return "no candles today"
+    end = bars[-1]["t"] + datetime.timedelta(minutes=BAR_MINUTES)
+    return "newest candle closed %s, %d minutes before this check" % (end.strftime("%H:%M"), (now - end).total_seconds() // 60)
+
+
+def pkt_now(a):
+    """--at cuts the clock to a time today, --now pins it."""
+    now = to_pkt(parse_now(a.now))
+    if getattr(a, "at", None):
+        try:
+            now = datetime.datetime.combine(now.date(), hm(a.at))
+        except ValueError:
+            raise PsxError("--at must look like 10:15")
+    return now
+
+
+def day_span(now):
+    midnight = datetime.datetime.combine(now.date(), datetime.time(0, 0))
+    return midnight, midnight + datetime.timedelta(days=1)
+
+
+def cmd_intraday(a, cfg):
+    now = pkt_now(a)
+    sym = clean_symbol(a.symbol)
+    got = get_candles([sym], *day_span(now), offline=a.offline).get(sym) or {"bars": []}
+    bars = complete_bars(got["bars"], now.date(), now)
+    if a.json:
+        print(json.dumps([dict(b, t=b["t"].isoformat()) for b in bars], indent=2))
+        return 0 if bars else 1
+    for b in bars[-a.show:]:
+        print("  %s  O %.2f  H %.2f  L %.2f  C %.2f  V %s" % (b["t"].strftime("%H:%M"), b["open"], b["high"], b["low"], b["close"], format(b["volume"], ",")))
+    print("%s: %s. Confirm against your broker's screen." % (sym, age_line(bars, now)))
+    return 0 if bars else 1
+
+
+def cmd_orb(a, cfg):
+    now = pkt_now(a)
+    if not sessions_for(now.date(), cfg):
+        print("The PSX is closed on %s (%s)." % (now.date(), holiday_name(now.date(), cfg) or "weekend"))
+        return 1
+    symbols = symbol_list(a.symbols) if a.symbols else [s for s, _ in read_universe(a.universe)]
+    data = get_candles(symbols, *day_span(now), offline=a.offline)
+    hits, counts = [], {"requested": len(symbols), "no_data": 0, "unusable": 0, "usable": 0}
+    newest = None
+    for sym in symbols:
+        got = data.get(sym)
+        if not got or not got["bars"]:
+            counts["no_data"] += 1
+            continue
+        st = orb_status(got["bars"], now, a.or_minutes, cfg)
+        if st["status"] == "forming":
+            print("The %d-minute opening range ends at %s. Run this again after that." % (a.or_minutes, st["range_ends"]))
+            return 1
+        if st["status"] == "unusable":
+            counts["unusable"] += 1
+            continue
+        counts["usable"] += 1
+        done = complete_bars(got["bars"], now.date(), now)
+        if done and (newest is None or done[-1]["t"] > newest):
+            newest = done[-1]["t"]
+        if st["status"] == "triggered":
+            hits.append(dict(st, symbol=sym))
+    hits.sort(key=lambda h: (h["at"], h["symbol"]))
+    doc = {"created_by": "trader-psx", "market": "psx", "mode": "orb", "as_of_pkt": now.strftime("%Y-%m-%d %H:%M"),
+           "or_minutes": a.or_minutes, "counts": counts, "hits": hits, "source": "pyPSX 5-minute candles", "note": NOTE}
+    if a.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print("PSX opening-range scan at %s Pakistan time: %d of %d charts usable (%d no data, %d with missing candles)." % (
+            now.strftime("%H:%M"), counts["usable"], counts["requested"], counts["no_data"], counts["unusable"]))
+        print("%d of %d closed above their %d-minute opening-range high:" % (len(hits), counts["usable"], a.or_minutes))
+        for h in hits[:a.show]:
+            print("  %s  %-8s %10s  range %.2f to %.2f  +%.2f%% over" % (h["at"], h["symbol"], "{:,.2f}".format(h["price"]), h["or_low"], h["or_high"], h["over_pct"]))
+        if newest:
+            print("Newest candle starts %s: check how far that is behind your broker's screen." % newest.strftime("%H:%M"))
+        print("A later hit is closer to the price now, and a hit goes stale as the price moves. " + NOTE)
+    if not a.no_write and counts["usable"]:
+        write_json(ORB_FILE, doc)
+    return 0 if hits else 1
+
+
+def cmd_entry(a, cfg):
+    now = pkt_now(a)
+    sym = clean_symbol(a.symbol)
+    got = get_candles([sym], *day_span(now), offline=a.offline).get(sym) or {"bars": []}
+    st = orb_status(got["bars"], now, a.or_minutes, cfg)
+    st.update(symbol=sym, as_of_pkt=now.strftime("%Y-%m-%d %H:%M"))
+    done = complete_bars(got["bars"], now.date(), now)
+    if a.json:
+        print(json.dumps(st, indent=2))
+    else:
+        s = st["status"]
+        if s == "triggered":
+            print("%s TRIGGERED at %s: closed %.2f, %.2f%% over the range high %.2f." % (sym, st["at"], st["price"], st["over_pct"], st["or_high"]))
+            print("Read the live price off your broker's screen, then: plan %s --entry PRICE --stop price:%.2f --write" % (
+                sym, (st["or_high"] + st["or_low"]) / 2.0))
+        elif s == "waiting":
+            print("%s waiting: last close %.2f, range high %.2f (%.2f away)." % (sym, st["last"], st["or_high"], st["or_high"] - st["last"]))
+        elif s == "expired":
+            print("%s expired: no close above %.2f before the entry window ended." % (sym, st["or_high"]))
+        elif s == "forming":
+            print("%s: the opening range ends at %s." % (sym, st["range_ends"]))
+        elif s == "unusable":
+            print("%s: not usable, %s (a halt, a thin stock or a feed gap)." % (sym, st["reason"]))
+        else:
+            print("%s: the PSX is closed today." % sym)
+        print("%s. It never places an order." % age_line(done, now).capitalize())
+    write_json(ENTRY_FILE, st)
+    return 0 if st["status"] == "triggered" else 1
+
+
+def cmd_history(a, cfg):
+    now = pkt_now(a)
+    sym = clean_symbol(a.symbol)
+    kind, target_r = parse_target(a.target)
+    if kind != "r":
+        raise PsxError("--target must be a multiple of the risk here, like 1R")
+    end = datetime.datetime.combine(now.date(), datetime.time(0, 0))
+    got = get_candles([sym], end - datetime.timedelta(days=a.days), end, offline=a.offline).get(sym) or {"bars": [], "gaps": []}
+    bars = [b for b in got["bars"] if b["t"] < end]
+    c = replay(bars, a.or_minutes, target_r, cfg)
+    if a.json:
+        print(json.dumps(dict(c, symbol=sym, gaps=got.get("gaps"), note=got.get("note")), indent=2))
+    else:
+        print("%s, %d sessions with candles in the last %d days: the %d-minute breakout fired %d times." % (sym, c["sessions"], a.days, a.or_minutes, c["fired"]))
+        print("Target %s first %d, stop at the range midpoint first %d, neither by the close %d." % (a.target.upper(), c["target"], c["stop"], c["neither"]))
+        for g in got.get("gaps") or []:
+            print("note: data gap: %s" % (g,))
+        if got.get("note"):
+            print("note: %s" % got["note"])
+        print("Past sessions, not a prediction. No costs, slippage or locked stocks are counted, and a candle touching both counts as the stop.")
+    return 0 if c["fired"] else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Pakistan Stock Exchange tools (trader-psx). Never places an order.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -990,10 +1301,35 @@ def main(argv=None):
     common(sub.add_parser("check", help="PASS or BLOCK against your limits"))
     common(sub.add_parser("ticket", help="the ticket to type into your broker's app"))
     common(sub.add_parser("record", help="log the order after you have placed it"))
+    p = common(sub.add_parser("intraday", help="today's 5-minute candles (needs a pyPSX key)"))
+    p.add_argument("symbol")
+    p.add_argument("--at", help="cut the clock at this time today, like 10:15")
+    p.add_argument("--show", type=int, default=12)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+    p = common(sub.add_parser("orb", help="opening-range breakouts so far (needs a pyPSX key)"))
+    p.add_argument("--symbols", help="OGDC,HBL. Default: the universe file")
+    p.add_argument("--universe", default=UNIVERSE)
+    p.add_argument("--at", help="cut the clock at this time today, like 10:15")
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--show", type=int, default=20)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+    p.add_argument("--no-write", action="store_true")
+    p = common(sub.add_parser("entry", help="waiting, triggered or expired (needs a pyPSX key)"))
+    p.add_argument("symbol")
+    p.add_argument("--at", help="cut the clock at this time today, like 10:15")
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
+    p = common(sub.add_parser("history", help="the breakout rule on past sessions (needs a pyPSX key)"))
+    p.add_argument("symbol")
+    p.add_argument("--days", type=int, default=60)
+    p.add_argument("--target", default="1R")
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--offline", metavar="FILE", help="saved candles JSON")
 
     a = ap.parse_args(argv)
     commands = {"clock": cmd_clock, "scan": cmd_scan, "news": cmd_news, "plan": cmd_plan,
-                "size": cmd_size, "check": cmd_check, "ticket": cmd_ticket, "record": cmd_record}
+                "size": cmd_size, "check": cmd_check, "ticket": cmd_ticket, "record": cmd_record,
+                "intraday": cmd_intraday, "orb": cmd_orb, "entry": cmd_entry, "history": cmd_history}
     try:
         return commands[a.cmd](a, load_config(a.config))
     except PsxError as e:

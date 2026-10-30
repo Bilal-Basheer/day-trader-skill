@@ -34,17 +34,19 @@ cp -r day-trader-skill/trader-psx ~/.claude/skills/
 
 | | |
 | --- | --- |
-| Prices | Yahoo daily bars for `SYMBOL.KA`, free and unofficial. **Daily only.** |
+| Prices | Yahoo daily bars for `SYMBOL.KA`, free and unofficial |
+| Intraday | 5-minute candles from pyPSX, with your own key (`orb`, `entry`, `history`) |
 | News | Business Recorder, Dawn, Express Tribune and ProPakistani RSS feeds |
 | Clock | PSX regular market in Pakistan time, including the split Friday |
 | Orders | A ticket you type into your own broker's app. It never places an order |
 
-**It is not bar-by-bar day trading.** No free source open to automated tools
-provides intraday PSX bars, so opening-range breakouts, the Entry Timer and the
-Time Machine have no PSX version. It does not read the PSX Data Portal, because
-that site's terms ban automated tools without PSX's written permission. Holidays,
-the price band and trading costs need checking in your config before you rely on
-them: the table in the SKILL.md says which rules are confirmed and which are not.
+**Without a pyPSX key it is daily only.** With one you get 5-minute candles, but
+pyPSX is a third party whose docs state no terms, delay figure or PSX licence, so
+check its candles against your broker before relying on them. There is no PSX
+version of the Time Machine's 10,000 replays: `history` counts past sessions instead.
+It does not read the PSX Data Portal, because that site's terms ban automated tools
+without PSX's written permission. Holidays, the price band and trading costs need
+checking in your config: the table in the SKILL.md says which rules are confirmed.
 
 ## Install
 
